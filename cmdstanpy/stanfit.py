@@ -543,7 +543,15 @@ class CmdStanMCMC:
                 )
                 for key in dzero:
                     if (
-                        key not in ['id', 'diagnostic_file']
+                        key
+                        not in [
+                            'id',
+                            'diagnostic_file',
+                            'metric_file',
+                            'stepsize',
+                            'init',
+                            'seed',
+                        ]
                         and dzero[key] != drest[key]
                     ):
                         raise ValueError(
