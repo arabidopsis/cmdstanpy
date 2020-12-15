@@ -4,14 +4,14 @@ import os
 import shutil
 import unittest
 from unittest.mock import Mock
-import pytest
-from testfixtures import LogCapture
-import numpy as np
-import tqdm
 
-from cmdstanpy.utils import EXTENSION
+import numpy as np
+import pytest
+import tqdm
+from testfixtures import LogCapture
+
 from cmdstanpy.model import CmdStanModel
-from cmdstanpy.utils import cmdstan_path
+from cmdstanpy.utils import EXTENSION, cmdstan_path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATAFILES_PATH = os.path.join(HERE, 'data')
@@ -31,6 +31,7 @@ model {
 
 BERN_STAN = os.path.join(DATAFILES_PATH, 'bernoulli.stan')
 BERN_EXE = os.path.join(DATAFILES_PATH, 'bernoulli' + EXTENSION)
+BERN_BASENAME = 'bernoulli'
 
 
 class CmdStanModelTest(unittest.TestCase):
@@ -50,22 +51,24 @@ class CmdStanModelTest(unittest.TestCase):
         self.assertTrue(True)
 
     def test_model_good(self):
-        # compile on instantiation
+        # compile on instantiation, override model name
         model = CmdStanModel(model_name='bern', stan_file=BERN_STAN)
         self.assertEqual(BERN_STAN, model.stan_file)
         self.assertTrue(model.exe_file.endswith(BERN_EXE.replace('\\', '/')))
         self.assertEqual('bern', model.name)
 
+        # default model name
+        model = CmdStanModel(stan_file=BERN_STAN)
+        self.assertEqual(BERN_BASENAME, model.name)
+
         # instantiate with existing exe
         model = CmdStanModel(stan_file=BERN_STAN, exe_file=BERN_EXE)
         self.assertEqual(BERN_STAN, model.stan_file)
         self.assertTrue(model.exe_file.endswith(BERN_EXE))
-        self.assertEqual('bernoulli', model.name)
 
         # instantiate with existing exe only - no model
         model2 = CmdStanModel(exe_file=BERN_EXE)
         self.assertEqual(BERN_EXE, model2.exe_file)
-        self.assertEqual('bernoulli', model2.name)
         with self.assertRaises(RuntimeError):
             model2.code()
         with self.assertRaises(RuntimeError):
@@ -82,6 +85,10 @@ class CmdStanModelTest(unittest.TestCase):
             CmdStanModel(stan_file=None, exe_file=None)
         with self.assertRaises(ValueError):
             CmdStanModel(model_name='bad')
+        with self.assertRaises(ValueError):
+            CmdStanModel(model_name='', stan_file=BERN_STAN)
+        with self.assertRaises(ValueError):
+            CmdStanModel(model_name='   ', stan_file=BERN_STAN)
 
     def test_stanc_options(self):
         opts = {
@@ -224,8 +231,7 @@ class CmdStanModelTest(unittest.TestCase):
         if os.path.exists(BERN_EXE):
             os.remove(BERN_EXE)
         model = CmdStanModel(
-            stan_file=BERN_STAN,
-            stanc_options={'include_paths': DATAFILES_PATH}
+            stan_file=BERN_STAN, stanc_options={'include_paths': DATAFILES_PATH}
         )
         self.assertEqual(BERN_STAN, model.stan_file)
         self.assertTrue(model.exe_file.endswith(BERN_EXE.replace('\\', '/')))

@@ -2,31 +2,36 @@
 
 import json
 import os
-import unittest
 import platform
-import shutil
-import string
 import random
+import shutil
+import stat
+import string
+import tempfile
+import unittest
 
 import numpy as np
 
-from cmdstanpy import _TMPDIR
+from cmdstanpy import _DOT_CMDSTAN, _DOT_CMDSTANPY, _TMPDIR
+from cmdstanpy.model import CmdStanModel
 from cmdstanpy.utils import (
+    MaybeDictToFilePath,
+    TemporaryCopiedFile,
+    check_sampler_csv,
     cmdstan_path,
+    cmdstan_version_at,
+    get_latest_cmdstan,
+    jsondump,
+    parse_rdump_value,
+    parse_var_dims,
+    rdump,
+    read_metric,
+    rload,
     set_cmdstan_path,
     validate_cmdstan_path,
-    get_latest_cmdstan,
-    check_sampler_csv,
-    MaybeDictToFilePath,
-    read_metric,
-    TemporaryCopiedFile,
+    validate_dir,
     windows_short_path,
-    rdump,
-    rload,
-    parse_rdump_value,
-    jsondump,
 )
-from cmdstanpy.model import CmdStanModel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATAFILES_PATH = os.path.join(HERE, 'data')
@@ -47,11 +52,15 @@ class CmdStanPathTest(unittest.TestCase):
                 self.assertEqual(cmdstan_path(), path)
                 self.assertTrue('CMDSTAN' in os.environ)
             else:
-                install_dir = os.path.expanduser(
-                    os.path.join('~', '.cmdstanpy')
+                cmdstan_dir = os.path.expanduser(
+                    os.path.join('~', _DOT_CMDSTAN)
                 )
-                install_version = os.path.expanduser(
-                    os.path.join(install_dir, get_latest_cmdstan(install_dir))
+                if not os.path.exists(cmdstan_dir):
+                    cmdstan_dir = os.path.expanduser(
+                        os.path.join('~', _DOT_CMDSTANPY)
+                    )
+                install_version = os.path.join(
+                    cmdstan_dir, get_latest_cmdstan(cmdstan_dir)
                 )
                 self.assertTrue(
                     os.path.samefile(cmdstan_path(), install_version)
@@ -65,51 +74,60 @@ class CmdStanPathTest(unittest.TestCase):
                     del os.environ['CMDSTAN']
 
     def test_non_spaces_location(self):
-        good_path = os.path.join(_TMPDIR, 'good_dir')
-        with TemporaryCopiedFile(good_path) as (pth, is_changed):
-            self.assertEqual(pth, good_path)
-            self.assertFalse(is_changed)
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            good_path = os.path.join(tmpdir, 'good_dir')
+            with TemporaryCopiedFile(good_path) as (pth, is_changed):
+                self.assertEqual(pth, good_path)
+                self.assertFalse(is_changed)
 
-        # prepare files for test
-        bad_path = os.path.join(_TMPDIR, 'bad dir')
-        os.makedirs(bad_path, exist_ok=True)
-        stan = os.path.join(DATAFILES_PATH, 'bernoulli.stan')
-        stan_bad = os.path.join(bad_path, 'bad name.stan')
-        shutil.copy(stan, stan_bad)
+            # prepare files for test
+            bad_path = os.path.join(tmpdir, 'bad dir')
+            os.makedirs(bad_path, exist_ok=True)
+            stan = os.path.join(DATAFILES_PATH, 'bernoulli.stan')
+            stan_bad = os.path.join(bad_path, 'bad name.stan')
+            shutil.copy(stan, stan_bad)
 
-        stan_copied = None
-        try:
-            with TemporaryCopiedFile(stan_bad) as (pth, is_changed):
-                stan_copied = pth
-                self.assertTrue(os.path.exists(stan_copied))
-                self.assertTrue(' ' not in stan_copied)
-                self.assertTrue(is_changed)
-                raise RuntimeError
-        except RuntimeError:
-            pass
+            stan_copied = None
+            try:
+                with TemporaryCopiedFile(stan_bad) as (pth, is_changed):
+                    stan_copied = pth
+                    self.assertTrue(os.path.exists(stan_copied))
+                    self.assertTrue(' ' not in stan_copied)
+                    self.assertTrue(is_changed)
+                    raise RuntimeError
+            except RuntimeError:
+                pass
 
-        if platform.system() != 'Windows':
-            self.assertFalse(os.path.exists(stan_copied))
+            if platform.system() != 'Windows':
+                self.assertFalse(os.path.exists(stan_copied))
 
-        # cleanup after test
-        shutil.rmtree(bad_path, ignore_errors=True)
+            # cleanup after test
+            shutil.rmtree(bad_path, ignore_errors=True)
 
     def test_set_path(self):
         if 'CMDSTAN' in os.environ:
             self.assertEqual(cmdstan_path(), os.environ['CMDSTAN'])
         else:
-            install_dir = os.path.expanduser(os.path.join('~', '.cmdstanpy'))
-            install_version = os.path.expanduser(
-                os.path.join(install_dir, get_latest_cmdstan(install_dir))
+            cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTAN))
+            if not os.path.exists(cmdstan_dir):
+                cmdstan_dir = os.path.expanduser(
+                    os.path.join('~', _DOT_CMDSTANPY)
+                )
+            install_version = os.path.join(
+                cmdstan_dir, get_latest_cmdstan(cmdstan_dir)
             )
             set_cmdstan_path(install_version)
             self.assertEqual(install_version, cmdstan_path())
             self.assertEqual(install_version, os.environ['CMDSTAN'])
 
     def test_validate_path(self):
-        install_dir = os.path.expanduser(os.path.join('~', '.cmdstanpy'))
-        install_version = os.path.expanduser(
-            os.path.join(install_dir, get_latest_cmdstan(install_dir))
+        cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTAN))
+        if not os.path.exists(cmdstan_dir):
+            cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTANPY))
+        install_version = os.path.join(
+            cmdstan_dir, get_latest_cmdstan(cmdstan_dir)
         )
         set_cmdstan_path(install_version)
         validate_cmdstan_path(install_version)
@@ -128,6 +146,44 @@ class CmdStanPathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no CmdStan binaries'):
             validate_cmdstan_path(path_test)
         shutil.rmtree(folder_name)
+
+    def test_validate_dir(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            path = os.path.join(tmpdir, 'cmdstan-M.m.p')
+            self.assertFalse(os.path.exists(path))
+            validate_dir(path)
+            self.assertTrue(os.path.exists(path))
+
+            _, file = tempfile.mkstemp(dir=_TMPDIR)
+            with self.assertRaisesRegex(Exception, 'File exists'):
+                validate_dir(file)
+
+            if platform.system() != 'Windows':
+                with self.assertRaisesRegex(
+                    Exception, 'Cannot create directory'
+                ):
+                    dir = tempfile.mkdtemp(dir=_TMPDIR)
+                    os.chmod(dir, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+                    validate_dir(os.path.join(dir, 'cmdstan-M.m.p'))
+
+    def test_munge_cmdstan_versions(self):
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            tdir = os.path.join(tmpdir, 'tmpdir_xxx')
+            os.makedirs(tdir)
+            os.makedirs(os.path.join(tdir, 'cmdstan-2.22.0-rc1'))
+            os.makedirs(os.path.join(tdir, 'cmdstan-2.22.0-rc2'))
+            self.assertEqual(get_latest_cmdstan(tdir), 'cmdstan-2.22.0-rc2')
+
+            os.makedirs(os.path.join(tdir, 'cmdstan-2.22.0'))
+            self.assertEqual(get_latest_cmdstan(tdir), 'cmdstan-2.22.0')
+
+    def test_cmdstan_version_at(self):
+        cmdstan_path()  # sets os.environ['CMDSTAN']
+        self.assertFalse(cmdstan_version_at(99, 99))
 
     def test_dict_to_file(self):
         file_good = os.path.join(DATAFILES_PATH, 'bernoulli_output_1.csv')
@@ -191,12 +247,36 @@ class CmdStanPathTest(unittest.TestCase):
 class ReadStanCsvTest(unittest.TestCase):
     def test_check_sampler_csv_1(self):
         csv_good = os.path.join(DATAFILES_PATH, 'bernoulli_output_1.csv')
-        dict = check_sampler_csv(csv_good)
+        dict = check_sampler_csv(
+            path=csv_good,
+            is_fixed_param=False,
+            iter_warmup=100,
+            iter_sampling=10,
+            thin=1,
+        )
         self.assertEqual('bernoulli_model', dict['model'])
         self.assertEqual(10, dict['num_samples'])
         self.assertFalse('save_warmup' in dict)
-        self.assertEqual(10, dict['draws'])
+        self.assertEqual(10, dict['draws_sampling'])
         self.assertEqual(8, len(dict['column_names']))
+
+        with self.assertRaisesRegex(
+            ValueError, 'config error, expected thin = 2'
+        ):
+            check_sampler_csv(
+                path=csv_good, iter_warmup=100, iter_sampling=20, thin=2
+            )
+        with self.assertRaisesRegex(
+            ValueError, 'config error, expected save_warmup'
+        ):
+            check_sampler_csv(
+                path=csv_good,
+                iter_warmup=100,
+                iter_sampling=10,
+                save_warmup=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'expected 1000 draws'):
+            check_sampler_csv(path=csv_good, iter_warmup=100)
 
     def test_check_sampler_csv_2(self):
         csv_bad = os.path.join(DATAFILES_PATH, 'no_such_file.csv')
@@ -245,7 +325,7 @@ class ReadStanCsvTest(unittest.TestCase):
         bern_fit = bern_model.sample(
             data=jdata,
             chains=1,
-            cores=1,
+            parallel_chains=1,
             seed=12345,
             iter_sampling=490,
             iter_warmup=490,
@@ -254,13 +334,35 @@ class ReadStanCsvTest(unittest.TestCase):
             adapt_delta=0.98,
         )
         csv_file = bern_fit.runset.csv_files[0]
-        dict = check_sampler_csv(csv_file)
+        dict = check_sampler_csv(
+            path=csv_file,
+            is_fixed_param=False,
+            iter_sampling=490,
+            iter_warmup=490,
+            thin=7,
+        )
         self.assertEqual(dict['num_samples'], 490)
         self.assertEqual(dict['thin'], 7)
-        self.assertEqual(dict['draws'], 70)
+        self.assertEqual(dict['draws_sampling'], 70)
         self.assertEqual(dict['seed'], 12345)
         self.assertEqual(dict['max_depth'], 11)
         self.assertEqual(dict['delta'], 0.98)
+
+        with self.assertRaisesRegex(ValueError, 'config error'):
+            check_sampler_csv(
+                path=csv_file,
+                is_fixed_param=False,
+                iter_sampling=490,
+                iter_warmup=490,
+                thin=9,
+            )
+        with self.assertRaisesRegex(ValueError, 'expected 490 draws, found 70'):
+            check_sampler_csv(
+                path=csv_file,
+                is_fixed_param=False,
+                iter_sampling=490,
+                iter_warmup=490,
+            )
 
 
 class ReadMetricTest(unittest.TestCase):
@@ -320,42 +422,51 @@ class WindowsShortPath(unittest.TestCase):
     def test_windows_short_path_directory(self):
         if platform.system() != 'Windows':
             return
-        original_path = os.path.join(_TMPDIR, 'new path')
-        os.makedirs(original_path, exist_ok=True)
-        assert os.path.exists(original_path)
-        assert ' ' in original_path
-        short_path = windows_short_path(original_path)
-        assert os.path.exists(short_path)
-        assert original_path != short_path
-        assert ' ' not in short_path
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            original_path = os.path.join(tmpdir, 'new path')
+            os.makedirs(original_path, exist_ok=True)
+            assert os.path.exists(original_path)
+            assert ' ' in original_path
+            short_path = windows_short_path(original_path)
+            assert os.path.exists(short_path)
+            assert original_path != short_path
+            assert ' ' not in short_path
 
     def test_windows_short_path_file(self):
         if platform.system() != 'Windows':
             return
-        original_path = os.path.join(_TMPDIR, 'new path', 'my_file.csv')
-        os.makedirs(os.path.split(original_path)[0], exist_ok=True)
-        assert os.path.exists(os.path.split(original_path)[0])
-        assert ' ' in original_path
-        assert os.path.splitext(original_path)[1] == '.csv'
-        short_path = windows_short_path(original_path)
-        assert os.path.exists(os.path.split(short_path)[0])
-        assert original_path != short_path
-        assert ' ' not in short_path
-        assert os.path.splitext(short_path)[1] == '.csv'
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            original_path = os.path.join(tmpdir, 'new path', 'my_file.csv')
+            os.makedirs(os.path.split(original_path)[0], exist_ok=True)
+            assert os.path.exists(os.path.split(original_path)[0])
+            assert ' ' in original_path
+            assert os.path.splitext(original_path)[1] == '.csv'
+            short_path = windows_short_path(original_path)
+            assert os.path.exists(os.path.split(short_path)[0])
+            assert original_path != short_path
+            assert ' ' not in short_path
+            assert os.path.splitext(short_path)[1] == '.csv'
 
     def test_windows_short_path_file_with_space(self):
         """Test that the function doesn't touch filename."""
         if platform.system() != 'Windows':
             return
-        original_path = os.path.join(_TMPDIR, 'new path', 'my file.csv')
-        os.makedirs(os.path.split(original_path)[0], exist_ok=True)
-        assert os.path.exists(os.path.split(original_path)[0])
-        assert ' ' in original_path
-        short_path = windows_short_path(original_path)
-        assert os.path.exists(os.path.split(short_path)[0])
-        assert original_path != short_path
-        assert ' ' in short_path
-        assert os.path.splitext(short_path)[1] == '.csv'
+        with tempfile.TemporaryDirectory(
+            prefix="cmdstan_tests", dir=_TMPDIR
+        ) as tmpdir:
+            original_path = os.path.join(tmpdir, 'new path', 'my file.csv')
+            os.makedirs(os.path.split(original_path)[0], exist_ok=True)
+            assert os.path.exists(os.path.split(original_path)[0])
+            assert ' ' in original_path
+            short_path = windows_short_path(original_path)
+            assert os.path.exists(os.path.split(short_path)[0])
+            assert original_path != short_path
+            assert ' ' in short_path
+            assert os.path.splitext(short_path)[1] == '.csv'
 
 
 class RloadTest(unittest.TestCase):
@@ -441,6 +552,73 @@ class RloadTest(unittest.TestCase):
         self.assertEqual(v_struct3[7, 0], 8)
         self.assertEqual(v_struct3[0, 1], 9)
         self.assertEqual(v_struct3[6, 1], 15)
+
+
+class ParseVarDimsTest(unittest.TestCase):
+    def test_parse_empty(self):
+        x = []
+        vars_dict = parse_var_dims(x)
+        self.assertEqual(len(vars_dict), 0)
+
+    def test_parse_missing(self):
+        with self.assertRaises(ValueError):
+            parse_var_dims(None)
+
+    def test_parse_scalar(self):
+        x = ['foo']
+        vars_dict = parse_var_dims(x)
+        self.assertEqual(len(vars_dict), 1)
+        self.assertEqual(vars_dict['foo'], 1)
+
+    def test_parse_scalars(self):
+        x = ['foo', 'foo1']
+        vars_dict = parse_var_dims(x)
+        self.assertEqual(len(vars_dict), 2)
+        self.assertEqual(vars_dict['foo'], 1)
+        self.assertEqual(vars_dict['foo1'], 1)
+
+    def test_parse_scalar_vec_scalar(self):
+        x = [
+            'foo',
+            'phi[1]',
+            'phi[2]',
+            'phi[3]',
+            'phi[4]',
+            'phi[5]',
+            'phi[6]',
+            'phi[7]',
+            'phi[8]',
+            'phi[9]',
+            'phi[10]',
+            'bar',
+        ]
+        vars_dict = parse_var_dims(x)
+        self.assertEqual(len(vars_dict), 3)
+        self.assertEqual(vars_dict['foo'], 1)
+        self.assertEqual(vars_dict['phi'], (10,))
+        self.assertEqual(vars_dict['bar'], 1)
+
+    def test_parse_scalar_matrix_vec(self):
+        x = [
+            'foo',
+            'phi[1,1]',
+            'phi[1,2]',
+            'phi[1,3]',
+            'phi[1,4]',
+            'phi[1,5]',
+            'phi[2,1]',
+            'phi[2,2]',
+            'phi[2,3]',
+            'phi[2,4]',
+            'phi[2,5]',
+            'bar[1]',
+            'bar[2]',
+        ]
+        vars_dict = parse_var_dims(x)
+        self.assertEqual(len(vars_dict), 3)
+        self.assertEqual(vars_dict['foo'], 1)
+        self.assertEqual(vars_dict['phi'], (2, 5))
+        self.assertEqual(vars_dict['bar'], (2,))
 
 
 if __name__ == '__main__':

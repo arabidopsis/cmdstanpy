@@ -1,30 +1,32 @@
 """
 Utility functions
 """
+import logging
+import math
 import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 from collections import OrderedDict
 from collections.abc import Sequence
 from numbers import Integral, Real
-
-try:
-    import ujson as json
-except ImportError:
-    import json
-import math
-import platform
-import re
-import subprocess
-import shutil
-import tempfile
-import logging
-import sys
-from typing import Dict, TextIO, List, Union, Tuple
+from typing import Dict, List, TextIO, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import ujson as json
 
-
-from cmdstanpy import _TMPDIR
+from cmdstanpy import (
+    _CMDSTAN_SAMPLING,
+    _CMDSTAN_THIN,
+    _CMDSTAN_WARMUP,
+    _DOT_CMDSTAN,
+    _DOT_CMDSTANPY,
+    _TMPDIR,
+)
 
 EXTENSION = '.exe' if platform.system() == 'Windows' else ''
 
@@ -37,72 +39,66 @@ def get_logger():
     return logger
 
 
-def get_latest_cmdstan(dot_dir: str) -> str:
+def validate_dir(install_dir: str):
+    """Check that specified install directory exists, can write."""
+    if not os.path.exists(install_dir):
+        try:
+            os.makedirs(install_dir)
+        except (IOError, OSError, PermissionError) as e:
+            raise ValueError(
+                'Cannot create directory: {}'.format(install_dir)
+            ) from e
+    else:
+        if not os.path.isdir(install_dir):
+            raise ValueError(
+                'File exists, should be a directory: {}'.format(install_dir)
+            )
+        try:
+            with open('tmp_test_w', 'w'):
+                pass
+            os.remove('tmp_test_w')  # cleanup
+        except OSError as e:
+            raise ValueError(
+                'Cannot write files to directory {}'.format(install_dir)
+            ) from e
+
+
+def get_latest_cmdstan(cmdstan_dir: str) -> str:
     """
     Given a valid directory path, find all installed CmdStan versions
     and return highest (i.e., latest) version number.
     Assumes directory populated via script `install_cmdstan`.
     """
     versions = [
-        name.split('-')[1]
-        for name in os.listdir(dot_dir)
-        if os.path.isdir(os.path.join(dot_dir, name))
+        ''.join(name.split('-')[1:])  # name may contain '-rc'
+        for name in os.listdir(cmdstan_dir)
+        if os.path.isdir(os.path.join(cmdstan_dir, name))
         and name.startswith('cmdstan-')
         and name[8].isdigit()
     ]
+    # munge rc for sort, e.g. 2.25.0-rc1 -> 2.25.0.-99
+    for i in range(len(versions)):  # # pylint: disable=C0200
+        tmp = versions[i].split('rc')
+        if len(tmp) == 1:
+            versions[i] = '.'.join([tmp[0], '0'])
+        else:
+            rc_sortable = str(int(tmp[1]) - 100)
+            versions[i] = '.'.join([tmp[0], rc_sortable])
+
     versions.sort(key=lambda s: list(map(int, s.split('.'))))
     if len(versions) == 0:
         return None
     latest = 'cmdstan-{}'.format(versions[len(versions) - 1])
+
+    # unmunge
+    tmp = latest.split('.')
+    prefix = '.'.join(tmp[0:3])
+    if int(tmp[3]) == 0:
+        latest = prefix
+    else:
+        tmp[3] = 'rc' + str(int(tmp[3]) + 100)
+        latest = '-'.join([prefix, tmp[3]])
     return latest
-
-
-class MaybeDictToFilePath:
-    """Context manager for json files."""
-
-    def __init__(self, *objs: Union[str, dict], logger: logging.Logger = None):
-        self._unlink = [False] * len(objs)
-        self._paths = [''] * len(objs)
-        self._logger = logger or get_logger()
-        i = 0
-        for obj in objs:
-            if isinstance(obj, dict):
-                data_file = create_named_text_file(
-                    dir=_TMPDIR, prefix='', suffix='.json'
-                )
-                self._logger.debug('input tempfile: %s', data_file)
-                if any(
-                    not item
-                    for item in obj
-                    if isinstance(item, (Sequence, np.ndarray))
-                ):
-                    rdump(data_file, obj)
-                else:
-                    jsondump(data_file, obj)
-                self._paths[i] = data_file
-                self._unlink[i] = True
-            elif isinstance(obj, str):
-                if not os.path.exists(obj):
-                    raise ValueError("File doesn't exist {}".format(obj))
-                self._paths[i] = obj
-            elif obj is None:
-                self._paths[i] = None
-            elif i == 1 and isinstance(obj, (Integral, Real)):
-                self._paths[i] = obj
-            else:
-                raise ValueError('data must be string or dict')
-            i += 1
-
-    def __enter__(self):
-        return self._paths
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        for can_unlink, path in zip(self._unlink, self._paths):
-            if can_unlink and path:
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
 
 
 def validate_cmdstan_path(path: str) -> None:
@@ -117,46 +113,6 @@ def validate_cmdstan_path(path: str) -> None:
             'no CmdStan binaries found, '
             'run command line script "install_cmdstan"'
         )
-
-
-class TemporaryCopiedFile:
-    """Context manager for tmpfiles, handles spaces in filepath."""
-
-    def __init__(self, file_path: str):
-        self._path = None
-        self._tmpdir = None
-        if ' ' in os.path.abspath(file_path) and platform.system() == 'Windows':
-            base_path, file_name = os.path.split(os.path.abspath(file_path))
-            os.makedirs(base_path, exist_ok=True)
-            try:
-                short_base_path = windows_short_path(base_path)
-                if os.path.exists(short_base_path):
-                    file_path = os.path.join(short_base_path, file_name)
-            except RuntimeError:
-                pass
-
-        if ' ' in os.path.abspath(file_path):
-            tmpdir = tempfile.mkdtemp()
-            if ' ' in tmpdir:
-                raise RuntimeError(
-                    'Unable to generate temporary path without spaces! \n'
-                    + 'Please move your stan file to location without spaces.'
-                )
-
-            _, path = tempfile.mkstemp(suffix='.stan', dir=tmpdir)
-
-            shutil.copy(file_path, path)
-            self._path = path
-            self._tmpdir = tmpdir
-        else:
-            self._path = file_path
-
-    def __enter__(self):
-        return self._path, self._tmpdir is not None
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._tmpdir:
-            shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
 def set_cmdstan_path(path: str) -> None:
@@ -182,12 +138,14 @@ def cmdstan_path() -> str:
     if 'CMDSTAN' in os.environ:
         cmdstan = os.environ['CMDSTAN']
     else:
-        cmdstan_dir = os.path.expanduser(os.path.join('~', '.cmdstanpy'))
+        cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTAN))
         if not os.path.exists(cmdstan_dir):
-            raise ValueError(
-                'no CmdStan installation found, '
-                'run command line script "install_cmdstan"'
-            )
+            cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTANPY))
+            if not os.path.exists(cmdstan_dir):
+                raise ValueError(
+                    'no CmdStan installation found, '
+                    'run command line script "install_cmdstan"'
+                )
         latest_cmdstan = get_latest_cmdstan(cmdstan_dir)
         if latest_cmdstan is None:
             raise ValueError(
@@ -198,6 +156,51 @@ def cmdstan_path() -> str:
         os.environ['CMDSTAN'] = cmdstan
     validate_cmdstan_path(cmdstan)
     return cmdstan
+
+
+def cmdstan_version_at(maj: int, min: int) -> bool:
+    """
+    Check that CmdStan version is at or above Maj.min version.
+    Parses version string out of CmdStan makefile in CmdStan path dir.
+
+    :param maj: Major version number
+    :param min: Minor version number
+
+    :return: True if version at or above, else False
+    """
+    # pylint:disable=bare-except
+    try:
+        path = cmdstan_path()
+        makefile = os.path.join(path, 'makefile')
+        if not os.path.exists(makefile):
+            raise ValueError(
+                'CmdStan installation {}: missing makefile'.format(path)
+            )
+        version = None
+        with open(makefile, 'r') as fd:
+            contents = fd.read()
+            start_idx = contents.find('CMDSTAN_VERSION := ') + len(
+                'CMDSTAN_VERSION := '
+            )
+            end_idx = contents.find('\n', start_idx)
+            version = contents[start_idx:end_idx]
+        if version is None:
+            raise ValueError(
+                'Cannot parse version from makefile: {}'.format(makefile)
+            )
+        splits = version.split('.')
+        if len(splits) < 2:
+            raise ValueError(
+                'Cannot parse version from makefile: {}'.format(makefile)
+            )
+        cur_maj = int(splits[0])
+        cur_min = int(splits[1])
+
+        if cur_maj > maj or (cur_maj == maj and cur_min >= min):
+            return True
+    except:  # noqa
+        pass
+    return False
 
 
 def cxx_toolchain_path(version: str = None) -> Tuple[str]:
@@ -211,33 +214,9 @@ def cxx_toolchain_path(version: str = None) -> Tuple[str]:
     if version is not None and not isinstance(version, str):
         raise TypeError('Format version number as a string')
     logger = get_logger()
-    toolchain_root = ''
     if 'CMDSTAN_TOOLCHAIN' in os.environ:
         toolchain_root = os.environ['CMDSTAN_TOOLCHAIN']
-        if os.path.exists(os.path.join(toolchain_root, 'mingw_64')):
-            compiler_path = os.path.join(
-                toolchain_root,
-                'mingw_64' if (sys.maxsize > 2 ** 32) else 'mingw_32',
-                'bin',
-            )
-            if os.path.exists(compiler_path):
-                tool_path = os.path.join(toolchain_root, 'bin')
-                if not os.path.exists(tool_path):
-                    tool_path = ''
-                    compiler_path = ''
-                    logger.warning(
-                        'Found invalid installion for RTools35 on %s',
-                        toolchain_root,
-                    )
-                    toolchain_root = ''
-            else:
-                compiler_path = ''
-                logger.warning(
-                    'Found invalid installion for RTools35 on %s',
-                    toolchain_root,
-                )
-                toolchain_root = ''
-        elif os.path.exists(os.path.join(toolchain_root, 'mingw64')):
+        if os.path.exists(os.path.join(toolchain_root, 'mingw64')):
             compiler_path = os.path.join(
                 toolchain_root,
                 'mingw64' if (sys.maxsize > 2 ** 32) else 'mingw32',
@@ -252,83 +231,120 @@ def cxx_toolchain_path(version: str = None) -> Tuple[str]:
                         'Found invalid installion for RTools40 on %s',
                         toolchain_root,
                     )
-                    toolchain_root = ''
+                    toolchain_root = None
             else:
                 compiler_path = ''
                 logger.warning(
                     'Found invalid installion for RTools40 on %s',
                     toolchain_root,
                 )
-                toolchain_root = ''
+                toolchain_root = None
+
+        elif os.path.exists(os.path.join(toolchain_root, 'mingw_64')):
+            compiler_path = os.path.join(
+                toolchain_root,
+                'mingw_64' if (sys.maxsize > 2 ** 32) else 'mingw_32',
+                'bin',
+            )
+            if os.path.exists(compiler_path):
+                tool_path = os.path.join(toolchain_root, 'bin')
+                if not os.path.exists(tool_path):
+                    tool_path = ''
+                    compiler_path = ''
+                    logger.warning(
+                        'Found invalid installion for RTools35 on %s',
+                        toolchain_root,
+                    )
+                    toolchain_root = None
+            else:
+                compiler_path = ''
+                logger.warning(
+                    'Found invalid installion for RTools35 on %s',
+                    toolchain_root,
+                )
+                toolchain_root = None
     else:
-        rtools_dir = os.path.expanduser(
-            os.path.join('~', '.cmdstanpy', 'RTools')
-        )
-        if not os.path.exists(rtools_dir):
-            raise ValueError(
-                'no RTools installation found, '
-                'run command line script "install_cxx_toolchain"'
-            )
-        compiler_path = ''
-        tool_path = ''
-        if version not in ('4', '40', '4.0') and os.path.exists(
-            os.path.join(rtools_dir, 'RTools35')
-        ):
-            toolchain_root = os.path.join(rtools_dir, 'RTools35')
-            compiler_path = os.path.join(
-                toolchain_root,
-                'mingw_64' if (sys.maxsize > 2 ** 32) else 'mingw_32',
-                'bin',
-            )
-            if os.path.exists(compiler_path):
-                tool_path = os.path.join(toolchain_root, 'bin')
-                if not os.path.exists(tool_path):
-                    tool_path = ''
-                    compiler_path = ''
-                    logger.warning(
-                        'Found invalid installion for RTools35 on %s',
+        rtools40_home = os.environ.get('RTOOLS40_HOME')
+        cmdstan_dir = os.path.expanduser(os.path.join('~', _DOT_CMDSTAN))
+        cmdstan_dir_old = os.path.expanduser(os.path.join('~', _DOT_CMDSTANPY))
+        for toolchain_root in (
+            [rtools40_home] if rtools40_home is not None else []
+        ) + [
+            os.path.join(cmdstan_dir, 'RTools40'),
+            os.path.join(cmdstan_dir_old, 'RTools40'),
+            os.path.join(os.path.abspath("/"), "RTools40"),
+            os.path.join(cmdstan_dir, 'RTools35'),
+            os.path.join(cmdstan_dir_old, 'RTools35'),
+            os.path.join(os.path.abspath("/"), "RTools35"),
+            os.path.join(cmdstan_dir, 'RTools'),
+            os.path.join(cmdstan_dir_old, 'RTools'),
+            os.path.join(os.path.abspath("/"), "RTools"),
+            os.path.join(os.path.abspath("/"), "RBuildTools"),
+        ]:
+            compiler_path = ''
+            tool_path = ''
+
+            if os.path.exists(toolchain_root):
+                if version not in ('35', '3.5', '3'):
+                    compiler_path = os.path.join(
                         toolchain_root,
+                        'mingw64' if (sys.maxsize > 2 ** 32) else 'mingw32',
+                        'bin',
                     )
-                    toolchain_root = ''
-            else:
-                compiler_path = ''
-                logger.warning(
-                    'Found invalid installion for RTools35 on %s',
-                    toolchain_root,
-                )
-                toolchain_root = ''
-        if (
-            not toolchain_root or version in ('4', '40', '4.0')
-        ) and os.path.exists(os.path.join(rtools_dir, 'RTools40')):
-            toolchain_root = os.path.join(rtools_dir, 'RTools40')
-            compiler_path = os.path.join(
-                toolchain_root,
-                'mingw64' if (sys.maxsize > 2 ** 32) else 'mingw32',
-                'bin',
-            )
-            if os.path.exists(compiler_path):
-                tool_path = os.path.join(toolchain_root, 'usr', 'bin')
-                if not os.path.exists(tool_path):
-                    tool_path = ''
-                    compiler_path = ''
-                    logger.warning(
-                        'Found invalid installion for RTools40 on %s',
+                    if os.path.exists(compiler_path):
+                        tool_path = os.path.join(toolchain_root, 'usr', 'bin')
+                        if not os.path.exists(tool_path):
+                            tool_path = ''
+                            compiler_path = ''
+                            logger.warning(
+                                'Found invalid installation for RTools40 on %s',
+                                toolchain_root,
+                            )
+                            toolchain_root = None
+                        else:
+                            break
+                    else:
+                        compiler_path = ''
+                        logger.warning(
+                            'Found invalid installation for RTools40 on %s',
+                            toolchain_root,
+                        )
+                        toolchain_root = None
+                else:
+                    compiler_path = os.path.join(
                         toolchain_root,
+                        'mingw_64' if (sys.maxsize > 2 ** 32) else 'mingw_32',
+                        'bin',
                     )
-                    toolchain_root = ''
+                    if os.path.exists(compiler_path):
+                        tool_path = os.path.join(toolchain_root, 'bin')
+                        if not os.path.exists(tool_path):
+                            tool_path = ''
+                            compiler_path = ''
+                            logger.warning(
+                                'Found invalid installation for RTools35 on %s',
+                                toolchain_root,
+                            )
+                            toolchain_root = None
+                        else:
+                            break
+                    else:
+                        compiler_path = ''
+                        logger.warning(
+                            'Found invalid installation for RTools35 on %s',
+                            toolchain_root,
+                        )
+                        toolchain_root = None
             else:
-                compiler_path = ''
-                logger.warning(
-                    'Found invalid installion for RTools40 on %s',
-                    toolchain_root,
-                )
-                toolchain_root = ''
+                toolchain_root = None
+
     if not toolchain_root:
         raise ValueError(
-            'no C++ toolchain installation found, '
-            'run command line script "install_cxx_toolchain"'
+            'no RTools toolchain installation found, '
+            'run command line script '
+            '"python -m cmdstanpy.install_cxx_toolchain"'
         )
-    logger.info('Adds C++ toolchain to $PATH: %s', toolchain_root)
+    logger.info('Add C++ toolchain to $PATH: %s', toolchain_root)
     os.environ['PATH'] = ';'.join(
         list(
             OrderedDict.fromkeys(
@@ -374,9 +390,9 @@ def rdump(path: str, data: Dict) -> None:
 
 def rload(fname: str) -> dict:
     """Parse data and parameter variable values from an R dump format file.
-       This parser only supports the subset of R dump data as described
-       in the "Dump Data Format" section of the CmdStan manual, i.e.,
-       scalar, vector, matrix, and array data types.
+    This parser only supports the subset of R dump data as described
+    in the "Dump Data Format" section of the CmdStan manual, i.e.,
+    scalar, vector, matrix, and array data types.
     """
     data_dict = {}
     with open(fname, 'r') as fd:
@@ -407,8 +423,8 @@ def rload(fname: str) -> dict:
 
 def parse_rdump_value(rhs: str) -> Union[int, float, np.array]:
     """Process right hand side of Rdump variable assignment statement.
-       Value is either scalar, vector, or multi-dim structure.
-       Use regex to capture structure values, dimensions.
+    Value is either scalar, vector, or multi-dim structure.
+    Use regex to capture structure values, dimensions.
     """
     pat = re.compile(
         r'structure\(\s*c\((?P<vals>[^)]*)\)'
@@ -431,23 +447,64 @@ def parse_rdump_value(rhs: str) -> Union[int, float, np.array]:
             val = float(rhs)
         else:
             val = int(rhs)
-    except TypeError:
-        raise ValueError('bad value in Rdump file: {}'.format(rhs))
+    except TypeError as e:
+        raise ValueError('bad value in Rdump file: {}'.format(rhs)) from e
     return val
 
 
-def check_sampler_csv(path: str, is_fixed_param: bool = False) -> Dict:
+def check_sampler_csv(
+    path: str,
+    is_fixed_param: bool = False,
+    iter_sampling: int = None,
+    iter_warmup: int = None,
+    save_warmup: bool = False,
+    thin: int = None,
+) -> Dict:
     """Capture essential config, shape from stan_csv file."""
     meta = scan_sampler_csv(path, is_fixed_param)
-    draws_spec = int(meta.get('num_samples', 1000))
-    if 'thin' in meta:
-        draws_spec = int(math.ceil(draws_spec / meta['thin']))
-    if meta['draws'] != draws_spec:
+    if thin is None:
+        thin = _CMDSTAN_THIN
+    elif thin > _CMDSTAN_THIN:
+        if 'thin' not in meta:
+            raise ValueError(
+                'bad csv file {}, '
+                'config error, expected thin = {}'.format(path, thin)
+            )
+        if meta['thin'] != thin:
+            raise ValueError(
+                'bad csv file {}, '
+                'config error, expected thin = {}, found {}'.format(
+                    path, thin, meta['thin']
+                )
+            )
+    draws_sampling = iter_sampling
+    if draws_sampling is None:
+        draws_sampling = _CMDSTAN_SAMPLING
+    draws_warmup = iter_warmup
+    if draws_warmup is None:
+        draws_warmup = _CMDSTAN_WARMUP
+    draws_warmup = int(math.ceil(draws_warmup / thin))
+    draws_sampling = int(math.ceil(draws_sampling / thin))
+    if meta['draws_sampling'] != draws_sampling:
         raise ValueError(
             'bad csv file {}, expected {} draws, found {}'.format(
-                path, draws_spec, meta['draws']
+                path, draws_sampling, meta['draws_sampling']
             )
         )
+    if save_warmup:
+        if not ('save_warmup' in meta and meta['save_warmup'] == 1):
+            print(meta)
+            raise ValueError(
+                'bad csv file {}, '
+                'config error, expected save_warmup = 1'.format(path)
+            )
+        if meta['draws_warmup'] != draws_warmup:
+            raise ValueError(
+                'bad csv file {}, '
+                'expected {} warmup draws, found {}'.format(
+                    path, draws_warmup, meta['draws_warmup']
+                )
+            )
     return meta
 
 
@@ -459,9 +516,9 @@ def scan_sampler_csv(path: str, is_fixed_param: bool = False) -> Dict:
         lineno = scan_config(fd, dict, lineno)
         lineno = scan_column_names(fd, dict, lineno)
         if not is_fixed_param:
-            lineno = scan_warmup(fd, dict, lineno)
+            lineno = scan_warmup_iters(fd, dict, lineno)
             lineno = scan_metric(fd, dict, lineno)
-        lineno = scan_draws(fd, dict, lineno)
+        lineno = scan_sampling_iters(fd, dict, lineno)
     return dict
 
 
@@ -472,10 +529,9 @@ def scan_optimize_csv(path: str) -> Dict:
     with open(path, 'r') as fd:
         lineno = scan_config(fd, dict, lineno)
         lineno = scan_column_names(fd, dict, lineno)
-        line = fd.readline().lstrip(' #\t')
+        line = fd.readline().lstrip(' #\t').rstrip()
         xs = line.split(',')
-        mle = [float(x) for x in xs]
-        dict['mle'] = mle
+        dict['mle'] = [float(x) for x in xs]
     return dict
 
 
@@ -498,29 +554,28 @@ def scan_variational_csv(path: str) -> Dict:
     with open(path, 'r') as fd:
         lineno = scan_config(fd, dict, lineno)
         lineno = scan_column_names(fd, dict, lineno)
-        line = fd.readline().lstrip(' #\t')
+        line = fd.readline().lstrip(' #\t').rstrip()
         lineno += 1
-        if not line.startswith('Stepsize adaptation complete.'):
-            raise ValueError(
-                'line {}: expecting adaptation msg, found:\n\t "{}"'.format(
-                    lineno, line
+        if line.startswith('Stepsize adaptation complete.'):
+            line = fd.readline().lstrip(' #\t\n')
+            lineno += 1
+            if not line.startswith('eta'):
+                raise ValueError(
+                    'line {}: expecting eta, found:\n\t "{}"'.format(
+                        lineno, line
+                    )
                 )
-            )
-        line = fd.readline().lstrip(' #\t\n')
-        lineno += 1
-        if not line.startswith('eta = 1'):
-            raise ValueError(
-                'line {}: expecting eta = 1, found:\n\t "{}"'.format(
-                    lineno, line
-                )
-            )
-        line = fd.readline().lstrip(' #\t\n')
-        lineno += 1
+            line = fd.readline().lstrip(' #\t\n')
+            lineno += 1
         xs = line.split(',')
         variational_mean = [float(x) for x in xs]
         dict['variational_mean'] = variational_mean
         dict['variational_sample'] = pd.read_csv(
-            path, comment='#', skiprows=lineno, header=None
+            path,
+            comment='#',
+            skiprows=lineno,
+            header=None,
+            float_precision='high',
         )
     return dict
 
@@ -558,7 +613,7 @@ def scan_config(fd: TextIO, config_dict: Dict, lineno: int) -> int:
     return lineno
 
 
-def scan_warmup(fd: TextIO, config_dict: Dict, lineno: int) -> int:
+def scan_warmup_iters(fd: TextIO, config_dict: Dict, lineno: int) -> int:
     """
     Check warmup iterations, if any.
     """
@@ -566,11 +621,14 @@ def scan_warmup(fd: TextIO, config_dict: Dict, lineno: int) -> int:
         return lineno
     cur_pos = fd.tell()
     line = fd.readline().strip()
+    draws_found = 0
     while len(line) > 0 and not line.startswith('#'):
         lineno += 1
+        draws_found += 1
         cur_pos = fd.tell()
         line = fd.readline().strip()
     fd.seek(cur_pos)
+    config_dict['draws_warmup'] = draws_found
     return lineno
 
 
@@ -581,9 +639,42 @@ def scan_column_names(fd: TextIO, config_dict: Dict, lineno: int) -> int:
     line = fd.readline().strip()
     lineno += 1
     names = line.split(',')
-    config_dict['column_names'] = tuple(names)
+    config_dict['column_names'] = tuple(_rename_columns(names))
     config_dict['num_params'] = len(names) - 1
     return lineno
+
+
+def _rename_columns(names: List) -> List:
+    names = [
+        re.sub(r',([\d,]+)$', r'[\1]', column.replace('.', ','))
+        for column in names
+    ]
+    return names
+
+
+def parse_var_dims(names: Tuple[str, ...]) -> Dict:
+    """
+    Use Stan CSV file column names to get variable names, dimensions.
+    Assumes that CSV file has been validated and column names are correct.
+    """
+    if names is None:
+        raise ValueError('missing argument "names"')
+    vars_dict = {}
+    idx = 0
+    while idx < len(names):
+        if names[idx].endswith('__'):
+            pass
+        elif '[' not in names[idx]:
+            vars_dict[names[idx]] = 1
+        else:
+            vs = names[idx].split('[')
+            if idx < len(names) - 1 and names[idx + 1].split('[')[0] == vs[0]:
+                idx += 1
+                continue
+            dims = [int(x) for x in vs[1][:-1].split(',')]
+            vars_dict[vs[0]] = tuple(dims)
+        idx += 1
+    return vars_dict
 
 
 def scan_metric(fd: TextIO, config_dict: Dict, lineno: int) -> int:
@@ -610,10 +701,10 @@ def scan_metric(fd: TextIO, config_dict: Dict, lineno: int) -> int:
         )
     try:
         float(stepsize.strip())
-    except ValueError:
+    except ValueError as e:
         raise ValueError(
             'line {}: invalid stepsize: {}'.format(lineno, stepsize)
-        )
+        ) from e
     line = fd.readline().strip()
     lineno += 1
     if not (
@@ -647,9 +738,9 @@ def scan_metric(fd: TextIO, config_dict: Dict, lineno: int) -> int:
         return lineno
 
 
-def scan_draws(fd: TextIO, config_dict: Dict, lineno: int) -> int:
+def scan_sampling_iters(fd: TextIO, config_dict: Dict, lineno: int) -> int:
     """
-    Parse draws, check elements per draw, save num draws to config_dict.
+    Parse sampling iteration, save number of iterations to config_dict.
     """
     draws_found = 0
     num_cols = len(config_dict['column_names'])
@@ -667,7 +758,7 @@ def scan_draws(fd: TextIO, config_dict: Dict, lineno: int) -> int:
             )
         cur_pos = fd.tell()
         line = fd.readline().strip()
-    config_dict['draws'] = draws_found
+    config_dict['draws_sampling'] = draws_found
     fd.seek(cur_pos)
     return lineno
 
@@ -729,8 +820,9 @@ def do_command(cmd: str, cwd: str = None, logger: logging.Logger = None) -> str:
     )
     stdout, stderr = proc.communicate()
     if proc.returncode:
+        msg = 'ERROR\n'
         if stderr:
-            msg = 'ERROR\n {} '.format(stderr.decode('utf-8').strip())
+            msg = '{}{} '.format(msg, stderr.decode('utf-8').strip())
         raise RuntimeError(msg)
     if stdout:
         return stdout.decode('utf-8').strip()
@@ -804,28 +896,168 @@ def create_named_text_file(dir: str, prefix: str, suffix: str) -> str:
     return path
 
 
-def install_cmdstan(version: str = None, dir: str = None) -> bool:
+def install_cmdstan(
+    version: str = None,
+    dir: str = None,
+    overwrite: bool = False,
+    verbose: bool = False,
+) -> bool:
     """
-    Run 'install_cmdstan' -script
+    Download and install a CmdStan release from GitHub by running
+    script ``install_cmdstan`` as a subprocess.  Downloads the release
+    tar.gz file to temporary storage.  Retries GitHub requests in order
+    to allow for transient network outages. Builds CmdStan executables
+    and tests the compiler by building example model ``bernoulli.stan``.
+
+    :param version: CmdStan version string, e.g. "2.24.1".
+        Defaults to latest CmdStan release.
+
+    :param dir: Path to install directory.  Defaults to hidden directory
+        ``$HOME/.cmdstan`` or ``$HOME/.cmdstanpy``, if the latter exists.
+        If no directory is specified and neither of the above directories
+        exist, directory ``$HOME/.cmdstan`` will be created and populated.
+
+    :param overwrite:  Boolean value; when ``True``, will overwrite and
+        rebuild an existing CmdStan installation.  Default is ``False``.
+
+    :param verbose:  Boolean value; when ``True``, output from CmdStan build
+        processes will be streamed to the console.  Default is ``False``.
+
+    :return: Boolean value; ``True`` for success.
     """
     logger = get_logger()
     python = sys.executable
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, 'install_cmdstan.py')
-    cmd = [python, path]
+    cmd = [python, '-u', path]
     if version is not None:
         cmd.extend(['--version', version])
     if dir is not None:
         cmd.extend(['--dir', dir])
+    if overwrite:
+        cmd.extend(['--overwrite', 'TRUE'])
+    if verbose:
+        cmd.extend(['--verbose', 'TRUE'])
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ
     )
     while proc.poll() is None:
-        output = proc.stdout.readline().decode('utf-8').strip()
-        if output:
-            logger.info(output)
-    proc.communicate()
+        print(proc.stdout.readline().decode('utf-8').strip())
+
+    _, stderr = proc.communicate()
     if proc.returncode:
-        logger.warning('CmdStan installation failed')
+        logger.warning('CmdStan installation failed.')
+        if stderr:
+            logger.warning(stderr.decode('utf-8').strip())
         return False
     return True
+
+
+class MaybeDictToFilePath:
+    """Context manager for json files."""
+
+    def __init__(
+        self, *objs: Union[str, dict, list], logger: logging.Logger = None
+    ):
+        self._unlink = [False] * len(objs)
+        self._paths = [''] * len(objs)
+        self._logger = logger or get_logger()
+        i = 0
+        for obj in objs:
+            if isinstance(obj, dict):
+                data_file = create_named_text_file(
+                    dir=_TMPDIR, prefix='', suffix='.json'
+                )
+                self._logger.debug('input tempfile: %s', data_file)
+                if any(
+                    not item
+                    for item in obj
+                    if isinstance(item, (Sequence, np.ndarray))
+                ):
+                    rdump(data_file, obj)
+                else:
+                    jsondump(data_file, obj)
+                self._paths[i] = data_file
+                self._unlink[i] = True
+            elif isinstance(obj, str):
+                if not os.path.exists(obj):
+                    raise ValueError("File doesn't exist {}".format(obj))
+                self._paths[i] = obj
+            elif isinstance(obj, list):
+                err_msgs = []
+                missing_obj_items = []
+                for j, obj_item in enumerate(obj):
+                    if not isinstance(obj_item, str):
+                        err_msgs.append(
+                            (
+                                'List element {} must be a filename string,'
+                                ' found {}'
+                            ).format(j, obj_item)
+                        )
+                    elif not os.path.exists(obj_item):
+                        missing_obj_items.append(
+                            "File doesn't exist: {}".format(obj_item)
+                        )
+                if err_msgs:
+                    raise ValueError('\n'.join(err_msgs))
+                if missing_obj_items:
+                    raise ValueError('\n'.join(missing_obj_items))
+                self._paths[i] = obj
+            elif obj is None:
+                self._paths[i] = None
+            elif i == 1 and isinstance(obj, (Integral, Real)):
+                self._paths[i] = obj
+            else:
+                raise ValueError('data must be string or dict')
+            i += 1
+
+    def __enter__(self):
+        return self._paths
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for can_unlink, path in zip(self._unlink, self._paths):
+            if can_unlink and path:
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+
+class TemporaryCopiedFile:
+    """Context manager for tmpfiles, handles spaces in filepath."""
+
+    def __init__(self, file_path: str):
+        self._path = None
+        self._tmpdir = None
+        if ' ' in os.path.abspath(file_path) and platform.system() == 'Windows':
+            base_path, file_name = os.path.split(os.path.abspath(file_path))
+            os.makedirs(base_path, exist_ok=True)
+            try:
+                short_base_path = windows_short_path(base_path)
+                if os.path.exists(short_base_path):
+                    file_path = os.path.join(short_base_path, file_name)
+            except RuntimeError:
+                pass
+
+        if ' ' in os.path.abspath(file_path):
+            tmpdir = tempfile.mkdtemp()
+            if ' ' in tmpdir:
+                raise RuntimeError(
+                    'Unable to generate temporary path without spaces! \n'
+                    + 'Please move your stan file to location without spaces.'
+                )
+
+            _, path = tempfile.mkstemp(suffix='.stan', dir=tmpdir)
+
+            shutil.copy(file_path, path)
+            self._path = path
+            self._tmpdir = tmpdir
+        else:
+            self._path = file_path
+
+    def __enter__(self):
+        return self._path, self._tmpdir is not None
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)

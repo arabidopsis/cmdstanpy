@@ -3,10 +3,12 @@
 import os
 import unittest
 from math import fabs
+
 import pytest
-from cmdstanpy.cmdstan_args import VariationalArgs, CmdStanArgs
+
+from cmdstanpy.cmdstan_args import CmdStanArgs, VariationalArgs
 from cmdstanpy.model import CmdStanModel
-from cmdstanpy.stanfit import RunSet, CmdStanVB
+from cmdstanpy.stanfit import CmdStanVB, RunSet
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATAFILES_PATH = os.path.join(HERE, 'data')
@@ -26,7 +28,7 @@ class CmdStanVBTest(unittest.TestCase):
                     filepath = os.path.join(root, filename)
                     os.remove(filepath)
 
-    def test_set_variational_attrs(self):
+    def test_instantiate(self):
         stan = os.path.join(
             DATAFILES_PATH, 'variational', 'eta_should_be_big.stan'
         )
@@ -41,31 +43,23 @@ class CmdStanVBTest(unittest.TestCase):
             method_args=args,
         )
         runset = RunSet(args=cmdstan_args, chains=1)
+        runset._csv_files = [
+            os.path.join(DATAFILES_PATH, 'variational', 'eta_big_output.csv')
+        ]
         variational = CmdStanVB(runset)
         self.assertIn(
             'CmdStanVB: model=eta_should_be_big', variational.__repr__()
         )
         self.assertIn('method=variational', variational.__repr__())
-
-        # check CmdStanVB.__init__ state
-        self.assertEqual(variational._column_names, ())
-        self.assertEqual(variational._variational_mean, {})
-        self.assertEqual(variational._variational_sample, None)
-
-        # process csv file, check attrs
-        output = os.path.join(
-            DATAFILES_PATH, 'variational', 'eta_big_output.csv'
-        )
-        variational._set_variational_attrs(output)
         self.assertEqual(
             variational.column_names,
-            ('lp__', 'log_p__', 'log_g__', 'mu.1', 'mu.2'),
+            ('lp__', 'log_p__', 'log_g__', 'mu[1]', 'mu[2]'),
         )
         self.assertAlmostEqual(
-            variational.variational_params_dict['mu.1'], 31.0299, places=2
+            variational.variational_params_dict['mu[1]'], 31.0299, places=2
         )
         self.assertAlmostEqual(
-            variational.variational_params_dict['mu.2'], 28.8141, places=2
+            variational.variational_params_dict['mu[2]'], 28.8141, places=2
         )
         self.assertEqual(variational.variational_sample.shape, (1000, 5))
 
@@ -92,7 +86,7 @@ class VariationalTest(unittest.TestCase):
         variational = model.variational(algorithm='meanfield', seed=12345)
         self.assertEqual(
             variational.column_names,
-            ('lp__', 'log_p__', 'log_g__', 'mu.1', 'mu.2'),
+            ('lp__', 'log_p__', 'log_g__', 'mu[1]', 'mu[2]'),
         )
 
         self.assertAlmostEqual(
@@ -103,10 +97,10 @@ class VariationalTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(
-            variational.variational_params_dict['mu.1'], 31.0418, places=2
+            variational.variational_params_dict['mu[1]'], 31.0418, places=2
         )
         self.assertAlmostEqual(
-            variational.variational_params_dict['mu.2'], 27.4463, places=2
+            variational.variational_params_dict['mu[2]'], 27.4463, places=2
         )
 
         self.assertEqual(
@@ -115,11 +109,11 @@ class VariationalTest(unittest.TestCase):
         )
         self.assertEqual(
             variational.variational_params_np[3],
-            variational.variational_params_pd['mu.1'][0],
+            variational.variational_params_pd['mu[1]'][0],
         )
         self.assertEqual(
             variational.variational_params_np[4],
-            variational.variational_params_pd['mu.2'][0],
+            variational.variational_params_pd['mu[2]'][0],
         )
 
         self.assertEqual(variational.variational_sample.shape, (1000, 5))
@@ -135,13 +129,13 @@ class VariationalTest(unittest.TestCase):
         variational = model.variational(algorithm='meanfield', seed=12345)
         self.assertEqual(
             variational.column_names,
-            ('lp__', 'log_p__', 'log_g__', 'mu.1', 'mu.2'),
+            ('lp__', 'log_p__', 'log_g__', 'mu[1]', 'mu[2]'),
         )
         self.assertAlmostEqual(
-            fabs(variational.variational_params_dict['mu.1']), 0.08, places=1
+            fabs(variational.variational_params_dict['mu[1]']), 0.08, places=1
         )
         self.assertAlmostEqual(
-            fabs(variational.variational_params_dict['mu.2']), 0.09, places=1
+            fabs(variational.variational_params_dict['mu[2]']), 0.09, places=1
         )
         self.assertTrue(True)
 
@@ -154,6 +148,10 @@ class VariationalTest(unittest.TestCase):
             RuntimeError, 'algorithm may not have converged'
         ):
             model.variational(algorithm='meanfield', seed=12345)
+
+        model.variational(
+            algorithm='meanfield', seed=12345, require_converged=False
+        )
 
 
 if __name__ == '__main__':

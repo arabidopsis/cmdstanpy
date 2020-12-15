@@ -2,11 +2,11 @@
 import os
 import sys
 
-from cmdstanpy import CmdStanModel, cmdstan_path
-
 # explicit import to test if it is installed
 # pylint: disable=E0401,W0611,C0411
-import tqdm # noqa
+import tqdm  # noqa
+
+from cmdstanpy import CmdStanModel, cmdstan_path
 
 
 def run_bernoulli_fit():
@@ -21,7 +21,7 @@ def run_bernoulli_fit():
     bernoulli_data = {'N': 10, 'y': [0, 1, 0, 0, 0, 0, 0, 0, 0, 1]}
     # Show progress
     bernoulli_fit = bernoulli_model.sample(
-        chains=4, cores=2, data=bernoulli_data, show_progress=True
+        chains=4, parallel_chains=2, data=bernoulli_data, show_progress=True
     )
 
     # summarize the results (wraps CmdStan `bin/stansummary`):

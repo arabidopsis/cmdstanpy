@@ -1,19 +1,23 @@
 """CmdStan argument tests"""
 
+import logging
 import os
 import platform
 import unittest
 from time import time
 
-from cmdstanpy import _TMPDIR
+from testfixtures import LogCapture
+
+from cmdstanpy import _TMPDIR, cmdstan_path
 from cmdstanpy.cmdstan_args import (
-    Method,
-    SamplerArgs,
     CmdStanArgs,
-    OptimizeArgs,
     GenerateQuantitiesArgs,
+    Method,
+    OptimizeArgs,
+    SamplerArgs,
     VariationalArgs,
 )
+from cmdstanpy.utils import cmdstan_version_at
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATAFILES_PATH = os.path.join(HERE, 'data')
@@ -202,10 +206,8 @@ class SamplerArgsTest(unittest.TestCase):
         )
 
         args = SamplerArgs(
-            adapt_init_phase=26,
-            adapt_metric_window=60,
-            adapt_step_size=34,
-            )
+            adapt_init_phase=26, adapt_metric_window=60, adapt_step_size=34
+        )
         args.validate(chains=4)
         cmd = args.compose(1, cmd=[])
         self.assertIn('method=sample algorithm=hmc adapt', ' '.join(cmd))
@@ -573,6 +575,56 @@ class CmdStanArgsTest(unittest.TestCase):
                     method_args=sampler_args,
                 )
 
+    def test_args_sig_figs(self):
+        sampler_args = SamplerArgs()
+        cmdstan_path()  # sets os.environ['CMDSTAN']
+        if not cmdstan_version_at(2, 25):
+            with LogCapture() as log:
+                logging.getLogger()
+                CmdStanArgs(
+                    model_name='bernoulli',
+                    model_exe='bernoulli.exe',
+                    chain_ids=[1, 2, 3, 4],
+                    sig_figs=12,
+                    method_args=sampler_args,
+                )
+            expect = (
+                'arg sig_figs not valid, CmdStan version must be 2.25 '
+                'or higher, using verson {} in directory {}'
+            ).format(
+                os.path.basename(cmdstan_path()),
+                os.path.dirname(cmdstan_path()),
+            )
+            log.check_present(('cmdstanpy', 'WARNING', expect))
+        else:
+            cmdstan_args = CmdStanArgs(
+                model_name='bernoulli',
+                model_exe='bernoulli.exe',
+                chain_ids=[1, 2, 3, 4],
+                sig_figs=12,
+                method_args=sampler_args,
+            )
+            cmd = cmdstan_args.compose_command(
+                idx=0, csv_file='bern-output-1.csv'
+            )
+            self.assertIn('sig_figs=', ' '.join(cmd))
+            with self.assertRaises(ValueError):
+                CmdStanArgs(
+                    model_name='bernoulli',
+                    model_exe='bernoulli.exe',
+                    chain_ids=[1, 2, 3, 4],
+                    sig_figs=-1,
+                    method_args=sampler_args,
+                )
+            with self.assertRaises(ValueError):
+                CmdStanArgs(
+                    model_name='bernoulli',
+                    model_exe='bernoulli.exe',
+                    chain_ids=[1, 2, 3, 4],
+                    sig_figs=20,
+                    method_args=sampler_args,
+                )
+
 
 class GenerateQuantitesTest(unittest.TestCase):
     def test_args_fitted_params(self):
@@ -603,11 +655,26 @@ class VariationalTest(unittest.TestCase):
         self.assertIn('method=variational', ' '.join(cmd))
         self.assertIn('output_samples=1', ' '.join(cmd))
 
-        args = VariationalArgs(tol_rel_obj=1)
+        args = VariationalArgs(tol_rel_obj=0.01)
         args.validate(chains=1)
         cmd = args.compose(idx=0, cmd=[])
         self.assertIn('method=variational', ' '.join(cmd))
-        self.assertIn('tol_rel_obj=1', ' '.join(cmd))
+        self.assertIn('tol_rel_obj=0.01', ' '.join(cmd))
+
+        args = VariationalArgs(adapt_engaged=True, adapt_iter=100)
+        args.validate(chains=1)
+        cmd = args.compose(idx=0, cmd=[])
+        self.assertIn('adapt engaged=1 iter=100', ' '.join(cmd))
+
+        args = VariationalArgs(adapt_engaged=False)
+        args.validate(chains=1)
+        cmd = args.compose(idx=0, cmd=[])
+        self.assertIn('adapt engaged=0', ' '.join(cmd))
+
+        args = VariationalArgs(eta=0.1)
+        args.validate(chains=1)
+        cmd = args.compose(idx=0, cmd=[])
+        self.assertIn('eta=0.1', ' '.join(cmd))
 
     def test_args_bad(self):
         args = VariationalArgs(algorithm='no_such_algo')
