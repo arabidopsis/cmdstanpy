@@ -422,6 +422,7 @@ class CmdStanModel:
         output_dir: str = None,
         save_diagnostics: bool = False,
         show_progress: Union[bool, str] = False,
+        refresh: int = None,
     ) -> CmdStanMCMC:
         """
         Run or more chains of the NUTS sampler to produce a set of draws
@@ -617,7 +618,6 @@ class CmdStanModel:
             )
             cores = cores_avail
 
-        refresh = None
         if show_progress:
             try:
                 import tqdm
