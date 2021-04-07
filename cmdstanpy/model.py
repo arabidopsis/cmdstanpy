@@ -438,6 +438,7 @@ class CmdStanModel:
         save_diagnostics: bool = False,
         show_progress: Union[bool, str] = False,
         validate_csv: bool = True,
+        refresh: int = None,
     ) -> CmdStanMCMC:
         """
         Run or more chains of the NUTS sampler to produce a set of draws
@@ -651,7 +652,6 @@ class CmdStanModel:
         )
         os.environ['STAN_NUM_THREADS'] = str(threads_per_chain)
 
-        refresh = None
         if show_progress:
             try:
                 import tqdm
